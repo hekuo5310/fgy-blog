@@ -13,16 +13,19 @@ import type { NodeJSLikeCallback, RenderData } from '../types';
 const preservedKeys = ['title', 'slug', 'path', 'layout', 'date', 'content'];
 
 const rHexoPostRenderEscape = /<hexoPostRenderCodeBlock>([\s\S]+?)<\/hexoPostRenderCodeBlock>/g;
+const rCommentEscape = /(<!--[\s\S]*?-->)/g;
 const rSwigTag = /(\{\{.+?\}\})|(\{#.+?#\})|(\{%.+?%\})/s;
 
 const rSwigPlaceHolder = /(?:<|&lt;)!--swig\uFFFC(\d+)--(?:>|&gt;)/g;
 const rCodeBlockPlaceHolder = /(?:<|&lt;)!--code\uFFFC(\d+)--(?:>|&gt;)/g;
+const rCommentHolder = /(?:<|&lt;)!--comment\uFFFC(\d+)--(?:>|&gt;)/g;
 
 const STATE_PLAINTEXT = 0;
 const STATE_SWIG_VAR = 1;
 const STATE_SWIG_COMMENT = 2;
 const STATE_SWIG_TAG = 3;
 const STATE_SWIG_FULL_TAG = 4;
+const STATE_PLAINTEXT_COMMENT = 5;
 
 const isNonWhiteSpaceChar = (char: string) => char !== '\r'
   && char !== '\n'
@@ -61,6 +64,14 @@ class PostRenderEscape {
     return str.replace(rCodeBlockPlaceHolder, PostRenderEscape.restoreContent(this.stored));
   }
 
+  restoreComments(str: string) {
+    return str.replace(rCommentHolder, PostRenderEscape.restoreContent(this.stored));
+  }
+
+  escapeComments(str: string) {
+    return str.replace(rCommentEscape, (_, content) => PostRenderEscape.escapeContent(this.stored, 'comment', content));
+  }
+
   escapeCodeBlocks(str: string) {
     return str.replace(rHexoPostRenderEscape, (_, content) => PostRenderEscape.escapeContent(this.stored, 'code', content));
   }
@@ -72,6 +83,7 @@ class PostRenderEscape {
   escapeAllSwigTags(str: string) {
     let state = STATE_PLAINTEXT;
     let buffer_start = -1;
+    let plaintext_comment_start = -1;
     let plain_text_start = 0;
     let output = '';
 
@@ -142,6 +154,12 @@ class PostRenderEscape {
               swig_tag_name_end = false;
               swig_start_idx[state] = idx;
             }
+          }
+          if (char === '<' && next_char === '!' && str[idx + 2] === '-' && str[idx + 3] === '-') {
+            flushPlainText(idx);
+            state = STATE_PLAINTEXT_COMMENT;
+            plaintext_comment_start = idx;
+            idx += 3;
           }
         } else if (state === STATE_SWIG_TAG) {
           if (char === '"' || char === '\'') {
@@ -232,10 +250,23 @@ class PostRenderEscape {
               swig_full_tag_end_buffer = '';
             }
           }
+        } else if (state === STATE_PLAINTEXT_COMMENT) {
+          if (char === '-' && next_char === '-' && str[idx + 2] === '>') {
+            state = STATE_PLAINTEXT;
+            const comment = str.slice(plaintext_comment_start, idx + 3);
+            pushAndReset(PostRenderEscape.escapeContent(this.stored, 'comment', comment));
+            idx += 2;
+          }
         }
         idx++;
       }
       if (state === STATE_PLAINTEXT) {
+        break;
+      }
+      if (state === STATE_PLAINTEXT_COMMENT) {
+        // Unterminated comment, just push the rest as comment
+        const comment = str.slice(plaintext_comment_start, length);
+        pushAndReset(PostRenderEscape.escapeContent(this.stored, 'comment', comment));
         break;
       }
       // If the swig tag is not closed, then it is a plain text, we need to backtrack
@@ -502,6 +533,7 @@ class Post {
       // Run "before_post_render" filters
       return ctx.execFilter('before_post_render', data, { context: ctx });
     }).then(() => {
+      // Escape all comments to avoid conflict with Nunjucks and code block
       data.content = cacheObj.escapeCodeBlocks(data.content);
       // Escape all Nunjucks/Swig tags
       let hasSwigTag = true;
@@ -534,7 +566,8 @@ class Post {
         }
       }, options);
     }).then(content => {
-      data.content = cacheObj.restoreCodeBlocks(content);
+      data.content = cacheObj.restoreComments(content);
+      data.content = cacheObj.restoreCodeBlocks(data.content);
 
       // Run "after_post_render" filters
       return ctx.execFilter('after_post_render', data, { context: ctx });
